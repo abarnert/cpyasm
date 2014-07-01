@@ -2,8 +2,10 @@
 
 """Assembles CPython bytecode out of source in the dis module's format."""
 
+import ast
 import dis
 import re
+import struct
 import types
 
 class Assembler:
@@ -18,20 +20,19 @@ class Assembler:
     _hasnamed = _hasconst | _hasfree | _hasname | _haslocal
     _hascompare = set(dis.hascompare)
     
-    def __init__(self, source=None,
+    def __init__(self, source=None, addnames=True, *,
                  constants=None, names=None, varnames=None, freevars=None,
-                 filename=None, firstlineno=0, current_offset=0,
-                 addnames=True):
+                 filename=None, firstlineno=0, current_offset=0):
         self.source = []
         self.filename = filename
         self._line = self.firstlineno = firstlineno
         self._offset = self.firstoffset = current_offset
         self._lnotab = []
         self._instructions = []
-        self.constants = constants or [] # co_consts
-        self.names = names or [] # co_names
-        self.varnames = varnames or [] # co_varnames
-        self.freevars = freevars or [] # co_freevars
+        self.constants = list(constants or []) # co_consts
+        self.names = list(names or []) # co_names
+        self.varnames = list(varnames or []) # co_varnames
+        self.freevars = list(freevars or []) # co_freevars
         self._labels = {} # map label to instruction index
         self._jumptargets = set()
         if source:
@@ -57,13 +58,13 @@ class Assembler:
             if instr.opcode < dis.HAVE_ARGUMENT:
                 return bytes((instr.opcode,))
             else:
-                return bytes((instr.opcode, instr.arg, 0))
+                return bytes((instr.opcode,)) + struct.pack('h', instr.arg)
         return b''.join(map(_encode, self._instructions))
 
     @property
     def lnotab(self):
         b = bytearray()
-        lastoffset, lastline = 0, 0
+        lastoffset, lastline = 0, self.firstlineno
         for offset, line in self._lnotab:
             doffset = offset - lastoffset
             dline = line - lastline
@@ -102,21 +103,22 @@ class Assembler:
     def _fixup(self):
         for i, instr in enumerate(self._instructions):
             if instr.opcode in self._hasjump:
-                if isinstance(inst.arg, str):
+                if isinstance(instr.arg, str):
                     try:
-                        target = self._labels[instr.arg]
+                        targetidx = self._labels[instr.arg]
+                        target = self._instructions[targetidx]
                     except LookupError:
                         # TODO: full SyntaxError
-                        raise SyntaxError('Unassigned label {}'.format(inst.arg))
+                        raise SyntaxError('Unassigned label {}'.format(instr.arg))
                     arg = argval = target.offset
                     if instr.opcode in self._hasjrel:
                         arg -= instr.offset + 3
                     argrepr = instr.argrepr
                     if not argrepr:
                         argrepr = 'to {} ({})'.format(instr.arg, argrepr)
-                    self._instructions[i] = inst._replace(arg=arg,
-                                                          argval=argval,
-                                                          argrepr=argrepr)
+                    self._instructions[i] = instr._replace(arg=arg,
+                                                           argval=argval,
+                                                           argrepr=argrepr)
                 elif not instr.argval:
                     argval = instr.arg
                     if instr.opcode in dis.hasjrel:
@@ -124,29 +126,28 @@ class Assembler:
                     argrepr = instr.argrepr
                     if not argrepr:
                         argrepr = 'to {}'.format(argval)
-                    self._instructions[i] = inst._replace(argval=argval,
-                                                          argrepr=argrepr)
+                    self._instructions[i] = instr._replace(argval=argval,
+                                                           argrepr=argrepr)
                 self._jumptargets.add(self._instructions[i].argval)
-        for i in self._jumptargets:
-            if not self._instructions[i].is_jump_target:
-                instr = self._instructions[i]._replace(is_jump_target=True)
-                self._instructions[i] = instr
+        for i, instr in enumerate(self._instructions):
+            if not instr.is_jump_target and instr in self._jumptargets:
+                self._instructions[i] = instr._replace(is_jump_target=True)
 
     def _addblank(self):
         self._line += 1
         return len(self._instructions), self._offset, self._line
                     
     def _addlabel(self, name):
-        self._labels[name] = len(self)
+        self._labels[name] = len(self._instructions)
         self._line += 1
         return len(self._instructions), self._offset, self._line
                     
     def _addinstr(self, instr):
         if instr.is_jump_target:
-            self._jumptargets.append(len(self._instructions))
+            self._jumptargets.add(instr.offset)
         self._instructions.append(instr)
         self._lnotab.append((self._offset, self._line))
-        self._offset += 1
+        self._offset += 1 if instr.opcode < dis.HAVE_ARGUMENT else 3
         self._line += 1
         return len(self._instructions), self._offset, self._line
     
@@ -184,7 +185,7 @@ class Assembler:
         except (ValueError, LookupError):
             raise SyntaxError('{} is not a valid comparison operator'.format(arg))
     def _addcompare(self, opname, opcode, arg, argrepr, target):
-        arg, argval = self._mapcompare(arg, argrepr)
+        arg, argval = self._mapcompare(arg)
         if not argrepr:
             argrepr = argval
         instr = dis.Instruction(opname, opcode, arg, argrepr, argrepr,
@@ -215,6 +216,8 @@ class Assembler:
             instr = dis.Instruction(opname, opcode, arg, argval, argrepr,
                                     self._offset, self._line, target)
             return self._addinstr(instr)
+        if arg[0] == '#':
+            arg = ast.literal_eval(arg[1:])
         argval = arg
         try:
             arg = namelist.index(argval)
@@ -238,11 +241,11 @@ class Assembler:
         except ValueError:
             raise SyntaxError('{} {} is not an integer'.format(kind, inputval))
         if inputval != curval:
-            raise SyntaxError('{} {} != {}'.format(kind, inputval, curval))
+            print('Warning: {} {} != {}'.format(kind, inputval, curval))
                 
     def _addparts(self, line, target, offset, opname, arg, argrepr, addnames):
         try:
-            opcode = dis.opmap[opname]
+            opcode = dis.opmap[opname.upper()]
         except LookupError:
             # TODO: full SyntaxError, and search SyntaxError for all
             raise SyntaxError('No such opcode: {}'.format(opname))
@@ -282,11 +285,11 @@ class Assembler:
     def _addline(self, line, addnames):
         if not line.strip():
             return self._addblank()
+        m = self._rlabel.match(line)
+        if m:
+            return self._addlabel(m.group('label'))
         m = self._rline.match(line)
         if not m:
-            m = self._rlabel.match(line)
-            if m:
-                return self._addlabel(m.group('label'))
             # TODO: full SyntaxError
             raise SyntaxError('Cannot parse {}'.format(repr(line)))
         line, target, offset, opname, arg, argrepr = m.groups()
@@ -301,12 +304,16 @@ def test():
     LOAD_FAST a
     CALL_FUNCTION 1
     POP_TOP
+    JUMP_ABSOLUTE stupid
 
+    stupid:
     LOAD_GLOBAL print
     LOAD_GLOBAL f
     CALL_FUNCTION 1
+    JUMP_FORWARD stupider
 
-    LOAD_CONST None
+    stupider:
+    LOAD_CONST #None
     RETURN_VALUE''', filename=__file__, firstlineno=329)
 
     global f
